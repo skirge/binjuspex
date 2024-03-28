@@ -13,14 +13,42 @@ import os
 import platform
 import re
 import time
+from pathlib import Path
 
-from binaryninja.binaryview import BinaryView
-from binaryninja.enums import DisassemblyOption, FunctionAnalysisSkipOverride
-from binaryninja.function import DisassemblySettings, Function
-from binaryninja.interaction import get_directory_name_input
-from binaryninja.lineardisassembly import LinearViewCursor, LinearViewObject
-from binaryninja.log import log_alert, log_error, log_info, log_warn
-from binaryninja.plugin import BackgroundTaskThread, PluginCommand
+from binaryninja import *
+
+from tree_sitter import Language, Parser, Query
+import emoji
+
+# directory path to the current script
+CURRENT_DIR = Path(__file__).parent
+
+# tree-sitter files
+TREE_SITTER_C = CURRENT_DIR / "tree-sitter-c"
+TREE_SITTER_LIB = CURRENT_DIR / "build" / "tree-sitter-c.so"
+
+# query to search tree-sitter's syntax tree for illegal identifier annotations
+FUNC_ANNOT_QUERY_STR = """
+(function_definition
+type: (primitive_type)
+declarator: (function_declarator
+    declarator: (identifier)
+    parameters: (parameter_list)
+    . (identifier) @annotation))
+"""
+
+# symbol types that are dumped in the pseudo C
+DUMPED_SYMBOL_TYPES = (
+    SymbolType.DataSymbol,
+    SymbolType.ImportedDataSymbol,
+    SymbolType.ExternalSymbol,
+)
+
+# regex for valid identifier syntax
+VALID_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*")
+
+parser: Parser
+func_annot_query: Query
 
 
 class PseudoCDump(BackgroundTaskThread):
@@ -107,6 +135,27 @@ class PseudoCDump(BackgroundTaskThread):
         Additionally, writes the content of each function into a <function_name>.c
         file in the provided destination folder.
         """
+        global parser
+        global func_annot_query
+
+        disas_settings = DisassemblySettings()
+        disas_settings.set_option(DisassemblyOption.ShowAddress, False)
+        disas_settings.set_option(DisassemblyOption.WaitForIL, True)
+        self.linear_obj = LinearViewObject.language_representation(
+            self.bv, disas_settings
+        )
+
+        # initialize tree-sitter
+        if not TREE_SITTER_LIB.is_file():
+            Language.build_library(str(TREE_SITTER_LIB), [str(TREE_SITTER_C)])
+            if not TREE_SITTER_LIB.is_file():
+                raise Exception("Failed to build tree-sitter lib")
+
+        c_language = Language(str(TREE_SITTER_LIB), "c")
+        parser = Parser()
+        parser.set_language(c_language)
+        func_annot_query = c_language.query(FUNC_ANNOT_QUERY_STR)
+
         self.destination_path = self.__create_directory()
         log_info(f'Number of functions to dump: {len(self.bv.functions)}')
         count = 1
@@ -140,7 +189,7 @@ def normalize_destination_file(destination_file: str,
     Return:
         The string containing the normalized file name.
     """
-    if 'Windows' in platform.system():
+    if 'Windows' in platform.os.name:
         normalized_destination_file = '.'.join(
             (re.sub(r'[><:"/\\|\?\*]', '_',
                     destination_file), filename_suffix))
@@ -166,10 +215,67 @@ def force_analysis(bv: BinaryView, function: Function) -> None:
             ''
             f'Analyzing the skipped function {bv.get_symbol_at(function.start)}'
         )
-        function.analysis_skip_override = (
-            FunctionAnalysisSkipOverride.NeverSkipFunctionAnalysis)
-        bv.update_analysis_and_wait()
+        function.analysis_skipped = False
+        # bv.update_analysis_and_wait()
 
+def fix_identifiers(self) -> bool:
+    """
+    Renames invalid identifiers ("invalid" from the C standard). Invalid
+    characters are replaced with "__". Renamed identifiers are updated in
+    the binary view (so pseudo C can be generated), however, they are later
+    reverted to avoid destructive renaming after performing psuedo-C dump.
+
+    Returns `True` if an identifier was renamed.
+    """
+    renamed = False
+
+    # track changes
+    state = self.bv.begin_undo_actions()
+
+    # global vars
+    #
+    # use a context manager to efficiently rename symbols. "Renaming"
+    # symbols here means defining a new symbol and undefining the old
+    # symbol.
+    with self.bv.bulk_modify_symbols():
+        for sym in self.bv.get_symbols():
+            if sym.type not in DUMPED_SYMBOL_TYPES:
+                continue
+
+            identifier = sym.name
+            if not VALID_IDENTIFIER_RE.fullmatch(identifier):
+                new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
+                new_sym = Symbol(
+                    sym.type,
+                    sym.address,
+                    identifier,
+                )
+                self.bv.define_user_symbol(new_sym)
+                self.bv.undefine_user_symbol(sym)
+
+                renamed = True
+
+    # local vars
+    #
+    # trigger a reanalysis of the function if a variable is renamed.
+    for func in self.bv.functions:
+        func_modified = False
+        for var in func.vars:
+            identifier = var.name
+            if not VALID_IDENTIFIER_RE.fullmatch(identifier):
+                new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
+                var.name = new_identifier
+
+                func_modified = True
+                renamed = True
+
+        if func_modified:
+            func.reanalyze()
+
+    # commit changes
+    self.bv.commit_undo_actions(state)
+
+    return renamed
 
 def get_pseudo_c(bv: BinaryView, function: Function) -> str:
     """Gets the Pseudo C of the function being dumped. It stores every
@@ -187,7 +293,6 @@ def get_pseudo_c(bv: BinaryView, function: Function) -> str:
         lines_of_code: A single string containing the entire Pseudo C code of
             the function.
     """
-    lines = []
     settings = DisassemblySettings()
     settings.set_option(DisassemblyOption.ShowAddress, False)
     settings.set_option(DisassemblyOption.WaitForIL, True)
@@ -198,15 +303,34 @@ def get_pseudo_c(bv: BinaryView, function: Function) -> str:
     cursor_end.seek_to_address(function.highest_address)
     header = bv.get_previous_linear_disassembly_lines(cursor_end)
 
-    for line in header:
-        lines.append(f'{str(line)}\n')
+    pseudo_c = "\n".join(
+        emoji.replace_emoji(str(line.contents), replace="")
+        for line in header + body
+    )
 
-    for line in body:
-        lines.append(f'{str(line)}\n')
+    return remove_function_annotations(pseudo_c)
 
-    lines_of_code = ''.join(lines)
-    return (lines_of_code)
+def remove_function_annotations(src: str) -> str:
+    global parser
+    global func_annot_query
+    """
+    Uses tree-sitter to locate invalid function annotations added by Binary
+    Ninja. e.g., appending "__noreturn", "__pure" to a function definition.
 
+    Any matches to the query string's like @annotation tags are removed,
+    rest is kept the same.
+    """
+    tree = parser.parse(bytes(src, "utf8"))
+    captures = func_annot_query.captures(tree.root_node)
+    src_list = list(src)
+
+    for node, _ in captures:
+        # replace each annotation with the empty string
+        for i in range(node.start_byte, node.end_byte):
+            src_list[i] = ""
+
+    # reconstruct source code from the list
+    return "".join(src_list)
 
 def dump_pseudo_c(bv: BinaryView, function=None) -> None:
     """
