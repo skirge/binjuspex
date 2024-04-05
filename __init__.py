@@ -42,6 +42,8 @@ DUMPED_SYMBOL_TYPES = (
     SymbolType.DataSymbol,
     SymbolType.ImportedDataSymbol,
     SymbolType.ExternalSymbol,
+    SymbolType.ImportAddressSymbol,
+    SymbolType.ImportedFunctionSymbol
 )
 
 # regex for valid identifier syntax
@@ -157,6 +159,7 @@ class PseudoCDump(BackgroundTaskThread):
         func_annot_query = c_language.query(FUNC_ANNOT_QUERY_STR)
 
         self.destination_path = self.__create_directory()
+        fix_identifiers(self.bv)
         log_info(f'Number of functions to dump: {len(self.bv.functions)}')
         count = 1
         for function in self.bv.functions:
@@ -218,7 +221,7 @@ def force_analysis(bv: BinaryView, function: Function) -> None:
         function.analysis_skipped = False
         # bv.update_analysis_and_wait()
 
-def fix_identifiers(self) -> bool:
+def fix_identifiers(bv) -> bool:
     """
     Renames invalid identifiers ("invalid" from the C standard). Invalid
     characters are replaced with "__". Renamed identifiers are updated in
@@ -230,36 +233,48 @@ def fix_identifiers(self) -> bool:
     renamed = False
 
     # track changes
-    state = self.bv.begin_undo_actions()
+    state = bv.begin_undo_actions()
 
     # global vars
     #
     # use a context manager to efficiently rename symbols. "Renaming"
     # symbols here means defining a new symbol and undefining the old
     # symbol.
-    with self.bv.bulk_modify_symbols():
-        for sym in self.bv.get_symbols():
-            if sym.type not in DUMPED_SYMBOL_TYPES:
-                continue
+    with bv.bulk_modify_symbols():
+        for sym in bv.get_symbols():
 
+            # some binaries add _ in beginning of symbols
+            # which confuses semgrep rules
             identifier = sym.name
-            if not VALID_IDENTIFIER_RE.fullmatch(identifier):
-                new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
+            if identifier[0] == '_':
+                identifier = identifier[1:]
                 new_sym = Symbol(
                     sym.type,
                     sym.address,
                     identifier,
                 )
-                self.bv.define_user_symbol(new_sym)
-                self.bv.undefine_user_symbol(sym)
-
+                bv.define_user_symbol(new_sym)
+                bv.undefine_user_symbol(sym)
                 renamed = True
+
+            if sym.type in DUMPED_SYMBOL_TYPES:
+
+                if not VALID_IDENTIFIER_RE.fullmatch(identifier):
+                    new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
+                    new_sym = Symbol(
+                        sym.type,
+                        sym.address,
+                        identifier,
+                    )
+                    bv.define_user_symbol(new_sym)
+                    bv.undefine_user_symbol(sym)
+
+                    renamed = True
 
     # local vars
     #
     # trigger a reanalysis of the function if a variable is renamed.
-    for func in self.bv.functions:
-        func_modified = False
+    for func in bv.functions:
         for var in func.vars:
             identifier = var.name
             if not VALID_IDENTIFIER_RE.fullmatch(identifier):
@@ -269,11 +284,8 @@ def fix_identifiers(self) -> bool:
                 func_modified = True
                 renamed = True
 
-        if func_modified:
-            func.reanalyze()
-
     # commit changes
-    self.bv.commit_undo_actions(state)
+    bv.commit_undo_actions(state)
 
     return renamed
 
