@@ -159,7 +159,7 @@ class PseudoCDump(BackgroundTaskThread):
         func_annot_query = c_language.query(FUNC_ANNOT_QUERY_STR)
 
         self.destination_path = self.__create_directory()
-        fix_identifiers(self.bv)
+        #fix_identifiers(self.bv)
         log_info(f'Number of functions to dump: {len(self.bv.functions)}')
         count = 1
         for function in self.bv.functions:
@@ -167,7 +167,7 @@ class PseudoCDump(BackgroundTaskThread):
             log_info(f'Dumping function {function_name}')
             self.progress = "Dumping Pseudo C: %d/%d" % (
                 count, len(self.bv.functions))
-            force_analysis(self.bv, function)
+            #force_analysis(self.bv, function)
             pcode = get_pseudo_c(self.bv, function)
             destination = os.path.join(
                 self.destination_path,
@@ -367,6 +367,6 @@ def dump_pseudo_c(bv: BinaryView, function=None) -> None:
 
 """Register the plugin that will be called with an address argument.
 """
-PluginCommand.register_for_address('Pseudo C Dump',
+PluginCommand.register_for_address('Binjuspex\\Pseudo C Dump',
                                    'Dumps Pseudo C for the whole code base',
                                    dump_pseudo_c)
