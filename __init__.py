@@ -17,15 +17,12 @@ from pathlib import Path
 
 from binaryninja import *
 
+import tree_sitter_c as tsc
 from tree_sitter import Language, Parser, Query
 import emoji
 
 # directory path to the current script
 CURRENT_DIR = Path(__file__).parent
-
-# tree-sitter files
-TREE_SITTER_C = CURRENT_DIR / "tree-sitter-c"
-TREE_SITTER_LIB = CURRENT_DIR / "build" / "tree-sitter-c.so"
 
 # query to search tree-sitter's syntax tree for illegal identifier annotations
 FUNC_ANNOT_QUERY_STR = """
@@ -147,15 +144,8 @@ class PseudoCDump(BackgroundTaskThread):
             self.bv, disas_settings
         )
 
-        # initialize tree-sitter
-        if not TREE_SITTER_LIB.is_file():
-            Language.build_library(str(TREE_SITTER_LIB), [str(TREE_SITTER_C)])
-            if not TREE_SITTER_LIB.is_file():
-                raise Exception("Failed to build tree-sitter lib")
-
-        c_language = Language(str(TREE_SITTER_LIB), "c")
-        parser = Parser()
-        parser.set_language(c_language)
+        c_language = Language(tsc.language())
+        parser = Parser(c_language)
         func_annot_query = c_language.query(FUNC_ANNOT_QUERY_STR)
 
         self.destination_path = self.__create_directory()
@@ -321,6 +311,7 @@ def get_pseudo_c(bv: BinaryView, function: Function) -> str:
     )
 
     return remove_function_annotations(pseudo_c)
+    #return pseudo_c
 
 def remove_function_annotations(src: str) -> str:
     global parser
@@ -336,10 +327,11 @@ def remove_function_annotations(src: str) -> str:
     captures = func_annot_query.captures(tree.root_node)
     src_list = list(src)
 
-    for node, _ in captures:
-        # replace each annotation with the empty string
-        for i in range(node.start_byte, node.end_byte):
-            src_list[i] = ""
+    if captures:
+        for node in captures['annotation']:
+            # replace each annotation with the empty string
+            for i in range(node.start_byte, node.end_byte):
+                src_list[i] = ""
 
     # reconstruct source code from the list
     return "".join(src_list)
