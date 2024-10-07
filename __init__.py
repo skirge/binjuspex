@@ -40,7 +40,8 @@ DUMPED_SYMBOL_TYPES = (
     SymbolType.ImportedDataSymbol,
     SymbolType.ExternalSymbol,
     SymbolType.ImportAddressSymbol,
-    SymbolType.ImportedFunctionSymbol
+    SymbolType.ImportedFunctionSymbol,
+    SymbolType.FunctionSymbol
 )
 
 # regex for valid identifier syntax
@@ -149,7 +150,8 @@ class PseudoCDump(BackgroundTaskThread):
         func_annot_query = c_language.query(FUNC_ANNOT_QUERY_STR)
 
         self.destination_path = self.__create_directory()
-        #fix_identifiers(self.bv)
+        renamed = fix_identifiers(self.bv)
+        self.bv.update_analysis_and_wait()
         log_info(f'Number of functions to dump: {len(self.bv.functions)}')
         count = 1
         for function in self.bv.functions:
@@ -157,7 +159,7 @@ class PseudoCDump(BackgroundTaskThread):
             log_info(f'Dumping function {function_name}')
             self.progress = "Dumping Pseudo C: %d/%d" % (
                 count, len(self.bv.functions))
-            #force_analysis(self.bv, function)
+            force_analysis(self.bv, function)
             pcode = get_pseudo_c(self.bv, function)
             destination = os.path.join(
                 self.destination_path,
@@ -165,7 +167,7 @@ class PseudoCDump(BackgroundTaskThread):
             with open(destination, 'wb') as file:
                 file.write(bytes(pcode, 'utf-8'))
             count += 1
-        log_alert(f'Done \nFiles saved in {self.destination_path}')
+        log_info(f'Done \nFiles saved in {self.destination_path}')
 
 
 def normalize_destination_file(destination_file: str,
@@ -209,7 +211,7 @@ def force_analysis(bv: BinaryView, function: Function) -> None:
             f'Analyzing the skipped function {bv.get_symbol_at(function.start)}'
         )
         function.analysis_skipped = False
-        # bv.update_analysis_and_wait()
+        bv.update_analysis_and_wait()
 
 def fix_identifiers(bv) -> bool:
     """
@@ -233,6 +235,9 @@ def fix_identifiers(bv) -> bool:
     with bv.bulk_modify_symbols():
         for sym in bv.get_symbols():
 
+            if sym.type not in DUMPED_SYMBOL_TYPES:
+                continue
+
             # some binaries add _ in beginning of symbols
             # which confuses semgrep rules
             identifier = sym.name
@@ -247,32 +252,32 @@ def fix_identifiers(bv) -> bool:
                 bv.undefine_user_symbol(sym)
                 renamed = True
 
-            if sym.type in DUMPED_SYMBOL_TYPES:
-
-                if not VALID_IDENTIFIER_RE.fullmatch(identifier):
-                    new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
-                    new_sym = Symbol(
-                        sym.type,
-                        sym.address,
-                        identifier,
-                    )
-                    bv.define_user_symbol(new_sym)
-                    bv.undefine_user_symbol(sym)
-
-                    renamed = True
-
-    # local vars
-    #
-    # trigger a reanalysis of the function if a variable is renamed.
-    for func in bv.functions:
-        for var in func.vars:
-            identifier = var.name
             if not VALID_IDENTIFIER_RE.fullmatch(identifier):
                 new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
-                var.name = new_identifier
+                new_sym = Symbol(
+                    sym.type,
+                    sym.address,
+                    new_identifier,
+                )
+                bv.define_user_symbol(new_sym)
+                bv.undefine_user_symbol(sym)
 
-                func_modified = True
                 renamed = True
+
+        # local vars
+        #
+        # trigger a reanalysis of the function if a variable is renamed.
+        for func in bv.functions:
+            for var in func.vars:
+                try:
+                    identifier = var.name
+                    if not VALID_IDENTIFIER_RE.fullmatch(identifier):
+                        new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
+                        var.set_name_async(new_identifier)
+
+                        renamed = True
+                except Exception as e:
+                    log_error(f'Exception occured during rename:{e}')
 
     # commit changes
     bv.commit_undo_actions(state)
