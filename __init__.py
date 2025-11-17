@@ -45,7 +45,7 @@ DUMPED_SYMBOL_TYPES = (
 )
 
 # regex for valid identifier syntax
-VALID_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*")
+VALID_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_:]*")
 
 parser: Parser
 func_annot_query: Query
@@ -253,7 +253,7 @@ def fix_identifiers(bv) -> bool:
                 renamed = True
 
             if not VALID_IDENTIFIER_RE.fullmatch(identifier):
-                new_identifier = re.sub(r"[^a-zA-Z0-9_]", "__", identifier)
+                new_identifier = re.sub(r"[^a-zA-Z0-9_:]", "__", identifier)
                 new_sym = Symbol(
                     sym.type,
                     sym.address,
